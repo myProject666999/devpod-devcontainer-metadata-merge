@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/loft-sh/devpod/pkg/devcontainer/config"
 	"github.com/loft-sh/log"
@@ -91,22 +92,12 @@ func GetImageMetadataFromContainer(containerDetails *config.ContainerDetails, su
 		return &config.ImageMetadataConfig{}, nil
 	}
 
-	imageMetadataConfig := &config.ImageMetadataConfig{}
-	multiple := []*config.ImageMetadata{}
-	err := json.Unmarshal([]byte(containerDetails.Config.Labels[ImageMetadataLabel]), &multiple)
+	raw, err := parseImageMetadataLabel(containerDetails.Config.Labels[ImageMetadataLabel], log)
 	if err != nil {
-		single := &config.ImageMetadata{}
-		err = json.Unmarshal([]byte(containerDetails.Config.Labels[ImageMetadataLabel]), single)
-		if err != nil {
-			log.Errorf("Error parsing image metadata: %v", err)
-			return &config.ImageMetadataConfig{}, nil
-		}
-
-		imageMetadataConfig.Raw = []*config.ImageMetadata{single}
-	} else {
-		imageMetadataConfig.Raw = multiple
+		return nil, err
 	}
 
+	imageMetadataConfig := &config.ImageMetadataConfig{Raw: raw}
 	err = substituteConfig(imageMetadataConfig, substituteContext)
 	if err != nil {
 		return nil, err
@@ -120,28 +111,70 @@ func GetImageMetadata(imageDetails *config.ImageDetails, substituteContext *conf
 		return &config.ImageMetadataConfig{}, nil
 	}
 
-	imageMetadataConfig := &config.ImageMetadataConfig{}
-	multiple := []*config.ImageMetadata{}
-	err := json.Unmarshal([]byte(imageDetails.Config.Labels[ImageMetadataLabel]), &multiple)
+	raw, err := parseImageMetadataLabel(imageDetails.Config.Labels[ImageMetadataLabel], log)
 	if err != nil {
-		single := &config.ImageMetadata{}
-		err = json.Unmarshal([]byte(imageDetails.Config.Labels[ImageMetadataLabel]), single)
-		if err != nil {
-			log.Errorf("Error parsing image metadata: %v", err)
-			return &config.ImageMetadataConfig{}, nil
-		}
-
-		imageMetadataConfig.Raw = []*config.ImageMetadata{single}
-	} else {
-		imageMetadataConfig.Raw = multiple
+		return nil, err
 	}
 
+	imageMetadataConfig := &config.ImageMetadataConfig{Raw: raw}
 	err = substituteConfig(imageMetadataConfig, substituteContext)
 	if err != nil {
 		return nil, err
 	}
 
 	return imageMetadataConfig, nil
+}
+
+// parseImageMetadataLabel decodes a devcontainer.metadata label. The label
+// may hold either an array of metadata snippets or a single object (the
+// shapes documented in the devcontainer spec).
+//
+// An array may mix valid objects with scalar/array elements: the invalid
+// elements are skipped with a warning while the valid objects are kept. A
+// label that is present but cannot be parsed into either shape, or that
+// contains no valid object at all, is a hard error so callers cannot
+// silently build a container whose base image metadata has vanished.
+func parseImageMetadataLabel(label string, log log.Logger) ([]*config.ImageMetadata, error) {
+	var generic interface{}
+	if err := json.Unmarshal([]byte(label), &generic); err != nil {
+		return nil, fmt.Errorf("parse %s label: %w", ImageMetadataLabel, err)
+	}
+
+	switch value := generic.(type) {
+	case []interface{}:
+		raw := []*config.ImageMetadata{}
+		for i, element := range value {
+			if _, ok := element.(map[string]interface{}); !ok {
+				log.Warnf("Skipping element %d in %s label: expected a metadata object, got %T", i, ImageMetadataLabel, element)
+				continue
+			}
+
+			entry := &config.ImageMetadata{}
+			elementBytes, err := json.Marshal(element)
+			if err != nil {
+				return nil, fmt.Errorf("re-encode %s label element %d: %w", ImageMetadataLabel, i, err)
+			}
+			if err := json.Unmarshal(elementBytes, entry); err != nil {
+				return nil, fmt.Errorf("parse %s label element %d: %w", ImageMetadataLabel, i, err)
+			}
+			raw = append(raw, entry)
+		}
+
+		if len(raw) == 0 {
+			return nil, fmt.Errorf("%s label array contains no valid metadata object", ImageMetadataLabel)
+		}
+		return raw, nil
+
+	case map[string]interface{}:
+		single := &config.ImageMetadata{}
+		if err := json.Unmarshal([]byte(label), single); err != nil {
+			return nil, fmt.Errorf("parse %s label object: %w", ImageMetadataLabel, err)
+		}
+		return []*config.ImageMetadata{single}, nil
+
+	default:
+		return nil, fmt.Errorf("%s label must be an object or an array of objects, got %T", ImageMetadataLabel, generic)
+	}
 }
 
 func substituteConfig(imageConfig *config.ImageMetadataConfig, substituteContext *config.SubstitutionContext) error {
